@@ -1,3 +1,263 @@
 <?xml version="1.0" encoding="utf-8"?>
 <search>
+  <entry>
+    <title>ZooKeeper客户端源码（三）——Watcher注册与通知</title>
+    <url>/2022/03/19/ZooKeeper%E5%AE%A2%E6%88%B7%E7%AB%AF%E6%BA%90%E7%A0%81%EF%BC%88%E4%B8%89%EF%BC%89%E2%80%94%E2%80%94Watcher%E6%B3%A8%E5%86%8C%E4%B8%8E%E9%80%9A%E7%9F%A5/</url>
+    <content><![CDATA[<p>
+        <img   class="lazyload lazyload-gif"
+          src="/images/loading.svg" data-src="https://gitee.com/stefanpy/myimg/raw/master/img/%E5%AE%A2%E6%88%B7%E7%AB%AFWatcher%E6%B3%A8%E5%86%8C%E4%B8%8E%E9%80%9A%E7%9F%A5.png"  alt="客户端Watcher注册与通知">
+      </p>
+<p><code>ZooKeeper</code> 提供了分布式数据的发布&#x2F;订阅功能。一个典型的发布&#x2F;订阅模型系统定义了一种一对多的订阅关系，能够让多个订阅者同时监听某一个主题对象，当这个主题对象自身状态变化时，会通知所有订阅者，使它们能够做出相应的处理。</p>
+<p><code>ZooKeeper</code> 允许客户端向服务端注册一个 <code>Watcher</code> 监听，当服务端的一些更新操作触发了这个 <code>Watcher</code>，就会向指定客户端发送一个事件通知来实现分布式的通知功能。</p>
+<p>
+        <img   class="lazyload lazyload-gif"
+          src="/images/loading.svg" data-src="https://gitee.com/stefanpy/myimg/raw/master/img/watcher%E6%A6%82%E5%BF%B5%E5%9B%BE.png"  alt="watcher概念图">
+      </p>
+<p>本篇仅基于客户端对<code>Watcher</code>注册与通知过程进行讲解，涉及到<code>Watcher</code>如何在服务端注册管理，又如何触发事件远程通知客户端的原理后续在讲解服务端源码时会补充。</p>
+<p>不过也不要觉得服务端的<code>Watcher</code>注册与通知逻辑就复杂，其实也比较简单，这里简单陈述以保内容完整：</p>
+<p><code>ZooKeeper</code>的<code>Watcher</code>机制是一个跨进程的发布&#x2F;订阅功能，客户端与服务端都需要保存数据节点和<code>Watcher</code>的关系，当节点的状态信息变更时就会触发一些事件，服务端先从自己的内存中找出节点对应的<code>Watcher</code>列表，然后一个个遍历生成事件通知消息，再远程发送给客户端；客户端接收到对应消息后，解析出<code>Wather</code>事件信息，得知是哪个数据节点，触发什么事件类型，然后客户端同样从内存中找到节点对应的<code>Watcher</code>列表，真正触发事件回调。</p>
+
+        <h2 id="一、基础类"   >
+          <a href="#一、基础类" class="heading-link"><i class="fas fa-link"></i></a><a href="#一、基础类" class="headerlink" title="一、基础类"></a>一、基础类</h2>
+      <p>
+        <img   class="lazyload lazyload-gif"
+          src="/images/loading.svg" data-src="https://gitee.com/stefanpy/myimg/raw/master/img/%E5%9F%BA%E7%A1%80%E7%B1%BB%E5%85%B3%E7%B3%BB.png"  alt="基础类关系">
+      </p>
+
+        <h3 id="1、Watcher"   >
+          <a href="#1、Watcher" class="heading-link"><i class="fas fa-link"></i></a><a href="#1、Watcher" class="headerlink" title="1、Watcher"></a>1、Watcher</h3>
+      <p>用户注册<code>watcher</code>都需要实现<code>Watcher</code>接口，实现<code>process</code>方法。</p>
+<figure class="highlight java"><div class="table-container"><table><tr><td class="code"><pre><span class="line">org.apache.zookeeper.Watcher</span><br><span class="line"><span class="keyword">public</span> <span class="keyword">interface</span> <span class="title class_">Watcher</span> &#123;</span><br><span class="line">    <span class="keyword">void</span> <span class="title function_">process</span><span class="params">(WatchedEvent event)</span>;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></div></figure>
+
+
+        <h3 id="2、WatchedEvent"   >
+          <a href="#2、WatchedEvent" class="heading-link"><i class="fas fa-link"></i></a><a href="#2、WatchedEvent" class="headerlink" title="2、WatchedEvent"></a>2、WatchedEvent</h3>
+      <p><code>process(WatchedEvent event)</code>的参数是<code>WatchedEvent</code>，定义事件信息：</p>
+<figure class="highlight java"><div class="table-container"><table><tr><td class="code"><pre><span class="line"><span class="comment">// org.apache.zookeeper.WatchedEvent</span></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">class</span> <span class="title class_">WatchedEvent</span> &#123;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> KeeperState keeperState;</span><br><span class="line">    <span class="keyword">private</span> <span class="keyword">final</span> EventType eventType;</span><br><span class="line">    <span class="keyword">private</span> String path;</span><br><span class="line">	... ...</span><br><span class="line">	<span class="comment">/**</span></span><br><span class="line"><span class="comment">	 *  将WatchedEvent转换为可以通过网络发送的类型</span></span><br><span class="line"><span class="comment">	 *  Convert WatchedEvent to type that can be sent over network</span></span><br><span class="line"><span class="comment">	 */</span></span><br><span class="line">	<span class="keyword">public</span> WatcherEvent <span class="title function_">getWrapper</span><span class="params">()</span> &#123;</span><br><span class="line">		<span class="keyword">return</span> <span class="keyword">new</span> <span class="title class_">WatcherEvent</span>(eventType.getIntValue(), keeperState.getIntValue(), path);</span><br><span class="line">	&#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></div></figure>
+
+<p><code>WatchedEvent</code>有3个变量，通知状态<code>keeperState</code>、节点事件类型<code>eventType</code>、节点<code>path</code>：<br><code>keeperState</code>和<code>eventType</code>都是<code>Watcher</code>中的枚举类。</p>
+
+        <h4 id="（1）KeeperState"   >
+          <a href="#（1）KeeperState" class="heading-link"><i class="fas fa-link"></i></a><a href="#（1）KeeperState" class="headerlink" title="（1）KeeperState"></a>（1）KeeperState</h4>
+      <div class="table-container"><table>
+<thead>
+<tr>
+<th>KeeperState</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Disconnected(0)</td>
+<td>客户端与服务端断开连接</td>
+</tr>
+<tr>
+<td>SyncConnected(3)</td>
+<td>客户端与服务端处于连接状态</td>
+</tr>
+<tr>
+<td>AuthFailed(4)</td>
+<td>授权失败</td>
+</tr>
+<tr>
+<td>ConnectedReadOnly(5)</td>
+<td>客户端连接到只读服务器。接收到这个状态后，唯一允许的操作是读取操作。这个状态只在只读客户端产生，读写客户端是不允许连接只读服务器的</td>
+</tr>
+<tr>
+<td>SaslAuthenticated(6)</td>
+<td>用于通知客户端他们已经通过了SaslAuthenticated，以后可以用sasl授权的权限执行Zookeeper动作</td>
+</tr>
+<tr>
+<td>Expired(-112)</td>
+<td>会话超时</td>
+</tr>
+<tr>
+<td>Closed(7)</td>
+<td>客户端已关闭。这个状态永远不会由服务器生成，由客户端本地生成。</td>
+</tr>
+</tbody></table></div>
+
+        <h4 id="（2）EventType"   >
+          <a href="#（2）EventType" class="heading-link"><i class="fas fa-link"></i></a><a href="#（2）EventType" class="headerlink" title="（2）EventType"></a>（2）EventType</h4>
+      <div class="table-container"><table>
+<thead>
+<tr>
+<th>EventType</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>None(-1)</td>
+<td>KeeperState为SyncConnected(3)时，表示客户端与服务端成功建立会话</td>
+</tr>
+<tr>
+<td>NodeCreated(1)</td>
+<td>数据节点创建</td>
+</tr>
+<tr>
+<td>NodeDeleted(2)</td>
+<td>数据节点被删除</td>
+</tr>
+<tr>
+<td>NodeDataChanged(3)</td>
+<td>数据节点的状态信息更新，即使更新内容一样，版本号，一样会触发</td>
+</tr>
+<tr>
+<td>NodeChildrenChanged(4)</td>
+<td>数据节点的孩子节点列表发生变更，特指子节点个数和组成情况的变更，即新增子节点或删除子节点，而子节点内容的变化是不会触发这个事件的</td>
+</tr>
+<tr>
+<td>DataWatchRemoved(5)</td>
+<td>数据节点的watcher被主动移除</td>
+</tr>
+<tr>
+<td>ChildWatchRemoved(6)</td>
+<td>孩子节点的watcher被主动移除</td>
+</tr>
+<tr>
+<td>PersistentWatchRemoved (7)</td>
+<td>持久有效的watcher被主动移除</td>
+</tr>
+</tbody></table></div>
+
+        <h3 id="3、WatcherEvent"   >
+          <a href="#3、WatcherEvent" class="heading-link"><i class="fas fa-link"></i></a><a href="#3、WatcherEvent" class="headerlink" title="3、WatcherEvent"></a>3、WatcherEvent</h3>
+      <p><code>WatcherEvent</code>是可以通过网络发送的事件信息封装。</p>
+<p>
+        <img   class="lazyload lazyload-gif"
+          src="/images/loading.svg" data-src="https://gitee.com/stefanpy/myimg/raw/master/img/WatcherEvent.png"  alt="WatcherEvent">
+      </p>
+<p><code>WatcherEvent</code>和<code>WatchedEvent</code>表示的是同一个事物，都是对一个<code>watcher</code>事件信息的封装，不同的是，<code>WatchedEvent</code> 是一个逻辑事件，用于服务端和客户端程序执行过程中所需的逻辑对象，而 <code>WatcherEvent</code> 因为实现了序列化接口，因此可以用于网络传输：</p>
+<ul>
+<li><code>serialize()</code>，可以将<code>Watcher</code>信息序列化到网络字节流中，然后发送到网络中。服务端远程通知客户端<code>watcher</code>时使用。</li>
+<li><code>deserialize()</code>，可以从网络字节流中反序列化出<code>Watcher</code>信息。客户端接收到服务端远程通知消息时使用。</li>
+</ul>
+<p>无论是<code>WatchedEvent</code>还是<code>WatcherEvent</code>，其对<code>watcher</code>事件信息的封装都是极其简单的，客户端无法直接从事件信息中获取对应数据节点的原始数据内容以及变更后的新数据内容，而是需要客户端再次主动去获取数据。</p>
+
+        <h3 id="4、WatchRegistration"   >
+          <a href="#4、WatchRegistration" class="heading-link"><i class="fas fa-link"></i></a><a href="#4、WatchRegistration" class="headerlink" title="4、WatchRegistration"></a>4、WatchRegistration</h3>
+      <p><code>WatchRegistration</code>是对<code>watcher</code>注册方式的抽象：<br>
+        <img   class="lazyload lazyload-gif"
+          src="/images/loading.svg" data-src="https://gitee.com/stefanpy/myimg/raw/master/img/WatchRegistration%E5%85%B3%E7%B3%BB.png"  alt="WatchRegistration关系">
+      <br>注册的动作是一样的，只是需要注册到不同的集合中，具体继承类，需要实现方法<code>WatchRegistration#getWatches</code>，获取相应集合，将<code>Watcher</code>加入节点<code>path</code>对应的列表中。</p>
+<p>如下是抽象类<code>WatchRegistration</code>部分代码：</p>
+<figure class="highlight java"><div class="table-container"><table><tr><td class="code"><pre><span class="line"><span class="keyword">protected</span> <span class="keyword">abstract</span> Map&lt;String, Set&lt;Watcher&gt;&gt; <span class="title function_">getWatches</span><span class="params">(<span class="type">int</span> rc)</span>;</span><br><span class="line"></span><br><span class="line"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title function_">register</span><span class="params">(<span class="type">int</span> rc)</span> &#123;</span><br><span class="line">    <span class="keyword">if</span> (rc == KeeperException.Code.OK.intValue()) &#123;</span><br><span class="line">        Map&lt;String, Set&lt;Watcher&gt;&gt; watches = getWatches(rc);</span><br><span class="line">        <span class="keyword">synchronized</span> (watches) &#123;</span><br><span class="line">            Set&lt;Watcher&gt; watchers = watches.get(clientPath);</span><br><span class="line">            <span class="keyword">if</span> (watchers == <span class="literal">null</span>) &#123;</span><br><span class="line">                watchers = <span class="keyword">new</span> <span class="title class_">HashSet</span>&lt;Watcher&gt;();</span><br><span class="line">                watches.put(clientPath, watchers);</span><br><span class="line">            &#125;</span><br><span class="line">            watchers.add(watcher);</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></div></figure>
+
+
+        <h3 id="5、WatcherSetEventPair"   >
+          <a href="#5、WatcherSetEventPair" class="heading-link"><i class="fas fa-link"></i></a><a href="#5、WatcherSetEventPair" class="headerlink" title="5、WatcherSetEventPair"></a>5、WatcherSetEventPair</h3>
+      <p>用户可能会对一个节点注册多个<code>watcher</code>，服务端远程触发客户端的<code>watcher</code>时，客户端需要将该节点对应的所有<code>watcher</code>都触发一次。<br>所以<code>WatcherSetEventPair</code>对<code>WatchedEvent</code>和<code>watchers</code>列表进行封装，方便<code>EventThread</code>线程处理<code>watcher</code>触发工作。</p>
+<p>
+        <img   class="lazyload lazyload-gif"
+          src="/images/loading.svg" data-src="https://gitee.com/stefanpy/myimg/raw/master/img/WatcherSetEventPair.png"  alt="WatcherSetEventPair">
+      </p>
+
+        <h3 id="6、ZKWatchManager"   >
+          <a href="#6、ZKWatchManager" class="heading-link"><i class="fas fa-link"></i></a><a href="#6、ZKWatchManager" class="headerlink" title="6、ZKWatchManager"></a>6、ZKWatchManager</h3>
+      <p><code>ZKWatchManager</code>作为客户端<code>watcher</code>管理器，实现了接口<code>ClientWatchManager</code>:</p>
+<p>
+        <img   class="lazyload lazyload-gif"
+          src="/images/loading.svg" data-src="https://gitee.com/stefanpy/myimg/raw/master/img/ClientWatchManager.png"  alt="ClientWatchManager">
+      </p>
+<p><code>ZKWatchManager</code>中用5个集合对应5种不同的<code>watcher</code>注册场景：</p>
+<ul>
+<li><code>dataWatches</code>，在调用<code>getData</code>、<code>getConfig</code>时注册了<code>watcher</code>，会使用<code>dataWatches</code>来存储<code>watcher</code>。</li>
+<li><code>existWatches</code>，对应<code>exists</code>。</li>
+<li><code>childWatches</code>，对应<code>getChildren</code>。</li>
+<li><code>persistentWatches</code>，给定节点持续有效的<code>watcher</code>集合，触发之后不会被移除。</li>
+<li><code>persistentRecursiveWatches</code>，给定节点及其递归所有子节点都持续有效的<code>watcher</code>集合，触发之后不会被移除。</li>
+</ul>
+<p>
+        <img   class="lazyload lazyload-gif"
+          src="/images/loading.svg" data-src="https://gitee.com/stefanpy/myimg/raw/master/img/ZKWatchManager.png"  alt="ZKWatchManager">
+      </p>
+<p>之前网上一直说<code>Zookeeper</code>的观察者注册一次只能触发一次，触发的同时会被移除，如果需要注册一次，可多次有效触发，客户端使用起来比较麻烦。</p>
+<p>所以官方弥补了这种场景，新加了<code>persistentWatches</code>和<code>persistentRecursiveWatches</code>两种集合来存储持续有效的<code>watcher</code>，触发之后不会被移除，如果要移除需要调用指定方法<code>ZKWatchManager#removeWatcher</code>，如果想注册持续有效的观察者，也是需要单独调用指定方法<code>ZooKeeper#addWatch</code>。</p>
+<p><code>ZKWatchManager</code>实现了接口<code>ClientWatchManager</code>，主要实现了<code>ClientWatchManager#materialize</code>方法，获取一个应该被触发事件的<code>watcher</code>列表：</p>
+<figure class="highlight java"><div class="table-container"><table><tr><td class="code"><pre><span class="line">org.apache.zookeeper.ZKWatchManager#materialize</span><br><span class="line"><span class="meta">@Override</span></span><br><span class="line"><span class="keyword">public</span> Set&lt;Watcher&gt; <span class="title function_">materialize</span><span class="params">(</span></span><br><span class="line"><span class="params">    Watcher.Event.KeeperState state,</span></span><br><span class="line"><span class="params">    Watcher.Event.EventType type,</span></span><br><span class="line"><span class="params">    String clientPath</span></span><br><span class="line"><span class="params">)</span> &#123;</span><br><span class="line">    <span class="keyword">final</span> Set&lt;Watcher&gt; result = <span class="keyword">new</span> <span class="title class_">HashSet</span>&lt;&gt;();</span><br><span class="line"></span><br><span class="line">    <span class="keyword">switch</span> (type) &#123;</span><br><span class="line">    <span class="keyword">case</span> None:</span><br><span class="line">	    <span class="comment">// ... ...省略None情况,</span></span><br><span class="line">        <span class="comment">// 无类型事件，判断 通知状态KeeperState，如果KeeperState不是SyncConnected 就把所有的 watcher容器都清空</span></span><br><span class="line">        <span class="comment">// 根据 EventType 从不同的集合中获取观察者列表</span></span><br><span class="line">        <span class="comment">// dataWatches、existWatches、childWatches在获取watcher列表时有移除操作</span></span><br><span class="line">        <span class="comment">// persistentWatches、persistentRecursiveWatches没有移除操作</span></span><br><span class="line">    <span class="keyword">case</span> NodeDataChanged:</span><br><span class="line">    <span class="keyword">case</span> NodeCreated:</span><br><span class="line">        <span class="keyword">synchronized</span> (dataWatches) &#123;</span><br><span class="line">            addTo(dataWatches.remove(clientPath), result);</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="keyword">synchronized</span> (existWatches) &#123;</span><br><span class="line">            addTo(existWatches.remove(clientPath), result);</span><br><span class="line">        &#125;</span><br><span class="line">        addPersistentWatches(clientPath, result);</span><br><span class="line">        <span class="keyword">break</span>;</span><br><span class="line">    <span class="keyword">case</span> NodeChildrenChanged:</span><br><span class="line">        <span class="keyword">synchronized</span> (childWatches) &#123;</span><br><span class="line">            addTo(childWatches.remove(clientPath), result);</span><br><span class="line">        &#125;</span><br><span class="line">        addPersistentWatches(clientPath, result);</span><br><span class="line">        <span class="keyword">break</span>;</span><br><span class="line">    <span class="keyword">case</span> NodeDeleted:</span><br><span class="line">        <span class="keyword">synchronized</span> (dataWatches) &#123;</span><br><span class="line">            addTo(dataWatches.remove(clientPath), result);</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="comment">// TODO This shouldn&#x27;t be needed, but just in case</span></span><br><span class="line">        <span class="keyword">synchronized</span> (existWatches) &#123;</span><br><span class="line">            Set&lt;Watcher&gt; list = existWatches.remove(clientPath);</span><br><span class="line">            <span class="keyword">if</span> (list != <span class="literal">null</span>) &#123;</span><br><span class="line">                addTo(list, result);</span><br><span class="line">                LOG.warn(<span class="string">&quot;We are triggering an exists watch for delete! Shouldn&#x27;t happen!&quot;</span>);</span><br><span class="line">            &#125;</span><br><span class="line">        &#125;</span><br><span class="line">        <span class="keyword">synchronized</span> (childWatches) &#123;</span><br><span class="line">            addTo(childWatches.remove(clientPath), result);</span><br><span class="line">        &#125;</span><br><span class="line">        addPersistentWatches(clientPath, result);</span><br><span class="line">        <span class="keyword">break</span>;</span><br><span class="line">    <span class="keyword">default</span>:</span><br><span class="line">        <span class="type">String</span> <span class="variable">errorMsg</span> <span class="operator">=</span> String.format(</span><br><span class="line">            <span class="string">&quot;Unhandled watch event type %s with state %s on path %s&quot;</span>,</span><br><span class="line">            type,</span><br><span class="line">            state,</span><br><span class="line">            clientPath);</span><br><span class="line">        LOG.error(errorMsg);</span><br><span class="line">        <span class="keyword">throw</span> <span class="keyword">new</span> <span class="title class_">RuntimeException</span>(errorMsg);</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="keyword">return</span> result;</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="keyword">private</span> <span class="keyword">void</span> <span class="title function_">addPersistentWatches</span><span class="params">(String clientPath, Set&lt;Watcher&gt; result)</span> &#123;</span><br><span class="line">    <span class="keyword">synchronized</span> (persistentWatches) &#123;</span><br><span class="line">        addTo(persistentWatches.get(clientPath), result);</span><br><span class="line">    &#125;</span><br><span class="line">    <span class="keyword">synchronized</span> (persistentRecursiveWatches) &#123;</span><br><span class="line">        <span class="keyword">for</span> (String path : PathParentIterator.forAll(clientPath).asIterable()) &#123;</span><br><span class="line">            addTo(persistentRecursiveWatches.get(path), result);</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></div></figure>
+
+<p>由源码可见，从 <code>dataWatches</code>、<code>existWatches</code>、<code>childWatches</code> 集合中获取<code>watcher</code>列表时有移除操作，而从<code>persistentWatches</code>、<code>persistentRecursiveWatches</code>获取时没有移除操作。</p>
+
+        <h2 id="二、Watcher注册流程"   >
+          <a href="#二、Watcher注册流程" class="heading-link"><i class="fas fa-link"></i></a><a href="#二、Watcher注册流程" class="headerlink" title="二、Watcher注册流程"></a>二、Watcher注册流程</h2>
+      <p>可以注册<code>watcher</code>的请求都是非事务请求，比如：</p>
+<figure class="highlight java"><div class="table-container"><table><tr><td class="code"><pre><span class="line"><span class="keyword">public</span> <span class="title function_">ZooKeeper</span><span class="params">(String connectString, <span class="type">int</span> sessionTimeout, Watcher watcher)</span></span><br><span class="line"><span class="keyword">public</span> <span class="type">byte</span>[] getData(<span class="keyword">final</span> String path, Watcher watcher, Stat stat)</span><br><span class="line"><span class="keyword">public</span> Stat <span class="title function_">exists</span><span class="params">(<span class="keyword">final</span> String path, Watcher watcher)</span></span><br><span class="line"><span class="keyword">public</span> List&lt;String&gt; <span class="title function_">getChildren</span><span class="params">(<span class="keyword">final</span> String path, Watcher watcher, Stat stat)</span></span><br><span class="line">... ...</span><br></pre></td></tr></table></div></figure>
+
+
+        <h3 id="1、构建WatchRegistration"   >
+          <a href="#1、构建WatchRegistration" class="heading-link"><i class="fas fa-link"></i></a><a href="#1、构建WatchRegistration" class="headerlink" title="1、构建WatchRegistration"></a>1、构建WatchRegistration</h3>
+      <p>需要注册的<code>Watcher</code>会被封装进一个<code>WatchRegistration</code>对象中，<code>WatchRegistration</code>抽象了注册的方式，会和请求体等一并包装进 <code>Packet</code>。</p>
+<p>需要注意，<code>Watcher</code>注册信息不会发送给服务端，而是只发送一个布尔值标注是否注册<code>Watcher</code>（<code>watch=true</code>），这样就减少了数据包的大小，降低了网络压力，同时也使得<code>Watcher</code>注册流程简单。</p>
+<p>以<code>getData</code>为例：</p>
+<p>
+        <img   class="lazyload lazyload-gif"
+          src="/images/loading.svg" data-src="https://gitee.com/stefanpy/myimg/raw/master/img/getData%E6%B3%A8%E5%86%8CWatcher.png"  alt="getData注册Watcher">
+      </p>
+
+        <h3 id="2、响应成功后注册Watcher"   >
+          <a href="#2、响应成功后注册Watcher" class="heading-link"><i class="fas fa-link"></i></a><a href="#2、响应成功后注册Watcher" class="headerlink" title="2、响应成功后注册Watcher"></a>2、响应成功后注册Watcher</h3>
+      <p>需要注册<code>Watcher</code>的请求发给服务端后，客户端并不会立刻在自己内存中存储<code>Watcher</code>关系，而是还需要根据请求的响应状态，如果响应状态OK，才会把<code>Watcher</code>注册到<code>ZKWatchManager</code>。</p>
+<p>
+        <img   class="lazyload lazyload-gif"
+          src="/images/loading.svg" data-src="https://gitee.com/stefanpy/myimg/raw/master/img/finishPacket.png"  alt="finishPacket">
+      </p>
+<p>如下图是<code>Wacther</code>注册流程：</p>
+<p>
+        <img   class="lazyload lazyload-gif"
+          src="/images/loading.svg" data-src="https://gitee.com/stefanpy/myimg/raw/master/img/watcher%E6%B3%A8%E5%86%8C%E8%BF%87%E7%A8%8B.png"  alt="watcher注册过程">
+      </p>
+
+        <h2 id="三、Watcher通知流程"   >
+          <a href="#三、Watcher通知流程" class="heading-link"><i class="fas fa-link"></i></a><a href="#三、Watcher通知流程" class="headerlink" title="三、Watcher通知流程"></a>三、Watcher通知流程</h2>
+      
+        <h3 id="1、处理事件通知信息"   >
+          <a href="#1、处理事件通知信息" class="heading-link"><i class="fas fa-link"></i></a><a href="#1、处理事件通知信息" class="headerlink" title="1、处理事件通知信息"></a>1、处理事件通知信息</h3>
+      <p>数据节点的状态信息发生变更后，服务端找到该节点的<code>watcher</code>列表，遍历生成事件通知信息发送给客户端。客户端接收到事件通知信息后，反解析出<code>WatcherEvent</code>对象，又转换成<code>WatchedEvent</code>，再提交到<code>EventThread</code>线程处理。</p>
+<p>如下是客户端处理事件通知信息<code>NOTIFICATION</code>的部分源码：</p>
+<p>
+        <img   class="lazyload lazyload-gif"
+          src="/images/loading.svg" data-src="https://gitee.com/stefanpy/myimg/raw/master/img/NOTIFICATION%E6%B6%88%E6%81%AF%E5%A4%84%E7%90%86.png"  alt="NOTIFICATION消息处理">
+      </p>
+
+        <h3 id="2、提交给EventThread线程"   >
+          <a href="#2、提交给EventThread线程" class="heading-link"><i class="fas fa-link"></i></a><a href="#2、提交给EventThread线程" class="headerlink" title="2、提交给EventThread线程"></a>2、提交给EventThread线程</h3>
+      <p>从事件通知信息中解析出<code>WatchedEvent</code>后，通过<code>WatchedEvent</code>的三个属性<code>keeperState</code>、<code>eventType</code>和 <code>path</code>从<code>ZKWatchManager</code>中取出符合要求的<code>Watcher</code>列表，然后将<code>WachedEvent</code>对象和<code>Watcher</code>列表封装进 <code>WatcherSetEventPair</code>并添加到<code>waitingEvents</code>队列。</p>
+<p>
+        <img   class="lazyload lazyload-gif"
+          src="/images/loading.svg" data-src="https://gitee.com/stefanpy/myimg/raw/master/img/queueEvent.png"  alt="提交给EventThread线程">
+      </p>
+
+        <h3 id="3、遍历waitingEvents队列"   >
+          <a href="#3、遍历waitingEvents队列" class="heading-link"><i class="fas fa-link"></i></a><a href="#3、遍历waitingEvents队列" class="headerlink" title="3、遍历waitingEvents队列"></a>3、遍历waitingEvents队列</h3>
+      <p>
+        <img   class="lazyload lazyload-gif"
+          src="/images/loading.svg" data-src="https://gitee.com/stefanpy/myimg/raw/master/img/%E9%81%8D%E5%8E%86waitingEvents%E9%98%9F%E5%88%97.png"  alt="遍历waitingEvents队列">
+      </p>
+
+        <h3 id="4、真正触发Watcher-process"   >
+          <a href="#4、真正触发Watcher-process" class="heading-link"><i class="fas fa-link"></i></a><a href="#4、真正触发Watcher-process" class="headerlink" title="4、真正触发Watcher#process"></a>4、真正触发Watcher#process</h3>
+      <p>
+        <img   class="lazyload lazyload-gif"
+          src="/images/loading.svg" data-src="C:\study\myStudy\ZooKeeperLearning\blog\img\真正触发Watcher%23process.png"  alt="真正触发Watcher#process">
+      </p>
+<p>如下图是<code>Watcher</code>通知流程：</p>
+<p>
+        <img   class="lazyload lazyload-gif"
+          src="/images/loading.svg" data-src="https://gitee.com/stefanpy/myimg/raw/master/img/watcher%E9%80%9A%E7%9F%A5%E8%BF%87%E7%A8%8B.png"  alt="watcher通知过程">
+      </p>
+
+        <h2 id="四、总结"   >
+          <a href="#四、总结" class="heading-link"><i class="fas fa-link"></i></a><a href="#四、总结" class="headerlink" title="四、总结"></a>四、总结</h2>
+      <p>1、<code>Watcher</code>注册时，客户端只发送了一个布尔值给服务端声明是否需要注册<code>Watcher</code>；只有当服务端那边<code>Wacther</code>注册成功了，且响应成功，客户端这边才会保存<code>Watcher</code>和节点的关系。</p>
+<p>2、<code>Wacther</code>通知时，只能从通知信息中得知是哪个节点发生什么事件，而无法得知具体发生了什么变更，要想得知必须再主动获取一次节点信息。</p>
+<p>本文源码基于<code>ZooKeeper3.7.0</code>版本。</p>
+<p>推荐阅读：《从Paxos到Zookeeper：分布式一致性原理与实践》倪超著。</p>
+]]></content>
+      <categories>
+        <category>ZooKeeper源码与实战</category>
+      </categories>
+      <tags>
+        <tag>zookeeper</tag>
+        <tag>Watcher</tag>
+      </tags>
+  </entry>
 </search>
